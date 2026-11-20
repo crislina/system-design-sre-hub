@@ -23,21 +23,69 @@
   {
     "id": "load-balancing",
     "category": "Networking",
-    "title": "Load Balancing：算法与流量不均",
+    "title": "Load Balancer：原理、算法、健康检查与故障排查",
     "level": "Senior → Staff",
-    "summary": "Round Robin、Least Requests、L4/L7、负载倾斜和健康检查之间的关系。",
+    "summary": "从 L4/L7、流量分配算法到健康检查、连接复用、过载保护和故障切换，系统掌握 Load Balancer 的设计与 Staff SRE 排障思路。",
     "sections": [
       {
-        "heading": "为什么 Round Robin 不一定公平",
-        "body": "请求数量均等不等于 CPU 或延迟均等：不同请求的处理成本、长连接、缓存命中和实例规格都可能不同。"
+        "heading": "Load Balancer 在系统架构中的位置",
+        "body": "典型请求路径：Client → DNS/CDN/WAF → Load Balancer → API Gateway / Service → Cache / Database。LB 的核心职责是将流量分配到合适的健康后端，提高可用性、容量利用率和故障隔离能力。需要明确：LB 不是万能的性能优化器，后端瓶颈、共享依赖和重试风暴不会因为加了 LB 就自动消失。"
       },
       {
-        "heading": "算法选择",
-        "body": "Round Robin 适合处理成本相近的请求；Least Requests 适合耗时差异明显的场景，但仍需考虑慢请求和连接复用；一致性哈希适合需要亲和性的场景。"
+        "heading": "L4 与 L7 Load Balancing",
+        "body": "L4 工作在传输层，通常基于 IP、端口和 TCP/UDP 连接信息转发，适合高吞吐、低开销、协议无关的场景。L7 能识别 HTTP 的 Host、Path、Header、Cookie 等信息，实现基于内容的路由、灰度发布、鉴权或限流，但需要更多解析开销。面试先问：需要按 URL/用户/请求类型路由吗？是否需要 TLS termination、HTTP/2 或 gRPC 支持？再决定 L4/L7，而不是默认 L7 更好。"
       },
       {
-        "heading": "排障路径",
-        "body": "先比较实例级 RPS、in-flight requests、CPU、P95、请求类型、连接数与错误率，再验证健康检查和路由权重。"
+        "heading": "常见算法：Round Robin 与 Weighted Round Robin",
+        "body": "Round Robin 按顺序轮流选择后端，简单、开销低，适用于后端规格相近且请求处理成本差异较小的情况。Weighted Round Robin 允许高容量实例承担更多流量，适合混合规格节点或渐进式发布。注意：每个实例收到相近数量的请求，不代表 CPU、内存、延迟或真实负载相同；请求成本和长连接分布可能完全不同。"
+      },
+      {
+        "heading": "Least Connections、Least Requests 与 Power of Two Choices",
+        "body": "Least Connections 倾向选择当前活跃连接数更少的实例，适合连接持续时间差异较大的 TCP 工作负载；但 HTTP keep-alive、HTTP/2 多路复用会削弱“连接数≈负载”的假设。Least Requests / Least Outstanding Requests 根据在途请求数选实例，通常更适合请求耗时差异大的 HTTP 服务。Power of Two Choices 随机选两个候选后端，再选负载较轻的一个，常在成本与效果之间取得平衡。任何算法都要确认负载指标究竟是连接、请求还是资源利用率。"
+      },
+      {
+        "heading": "一致性哈希、Session Affinity 与热点问题",
+        "body": "一致性哈希通常按用户 ID、Cookie 或请求键将流量映射到节点，适合缓存局部性、分片或有状态会话。优点是节点变化时减少键重映射；代价是热门键可能形成热点，且故障转移后仍需处理会话与状态一致性。优先考虑服务无状态化；若必须使用 sticky session，要明确故障时如何重新路由、是否丢失会话，以及扩缩容的影响。"
+      },
+      {
+        "heading": "Health Check：Liveness 不等于 Readiness",
+        "body": "Liveness 关心进程是否需要重启；Readiness 关心实例是否应接收新请求。LB 的主动健康检查可探测 HTTP 状态、TCP 握手或专用就绪端点；被动健康检查可根据连接失败、超时和 5xx 统计摘除异常节点。不能只检查进程存活：进程可能仍能响应 /health，却因线程池耗尽、数据库连接池等待或依赖异常无法服务真实请求。反过来，也不能把所有非关键下游故障都当作 Not Ready，否则可能全体实例同时被摘流。"
+      },
+      {
+        "heading": "健康检查阈值、抖动与恢复",
+        "body": "设计健康检查时要定义间隔、超时、连续失败阈值、连续成功阈值和恢复预热。阈值过敏会因瞬时抖动频繁摘流，阈值过松又会让故障节点持续接收请求。恢复后应考虑 slow start / warm-up，避免刚恢复的实例立刻承受满负载。关键排查点：检查实际探测路径、探测来源网络、LB 与应用日志、错误率、健康状态变更时间线，以及是否出现所有后端同时 Unhealthy。"
+      },
+      {
+        "heading": "连接复用、HTTP/2 与负载倾斜",
+        "body": "客户端到 LB、LB 到后端是不同的连接池与连接生命周期。长连接、HTTP keep-alive、HTTP/2/gRPC 多路复用、连接级哈希可能导致请求在少量后端上集中。即使算法是 Round Robin，也要确认它在“每条连接”还是“每个请求”层面做决策。排障时比较每个后端的 RPS、活跃连接、in-flight requests、CPU、线程池、连接池等待时间、P95/P99，以及请求路径和负载类型分布。"
+      },
+      {
+        "heading": "Timeout、Retry 与 Retry Storm",
+        "body": "请求超时可能发生在客户端、LB、应用或下游依赖。必须梳理每层 timeout 和 retry budget，避免客户端、Gateway 与服务同时重试导致放大。LB 重新选择后端重试时，还要考虑幂等性、已提交但响应丢失的请求，以及重试是否跨越多个故障域。对非幂等写入不能简单地无条件重试。常见缓解包括指数退避、jitter、限制重试次数、限流、熔断与负载卸载。"
+      },
+      {
+        "heading": "过载保护与优雅摘流",
+        "body": "当某实例达到 CPU、线程池、队列或下游连接池容量上限时，LB 不应只凭健康检查继续无上限灌流。可以结合并发限制、队列上限、503/429、熔断和优先级降级保护服务。部署或缩容时应先标记 Not Ready，停止接收新请求，再允许已有请求在 drain timeout 内完成；同时检查长连接、WebSocket 和 gRPC stream 是否需要特殊处理。"
+      },
+      {
+        "heading": "高可用设计：LB 自身也可能是单点",
+        "body": "需要区分单个 LB 实例、LB 集群、区域和数据中心的故障域。常见手段包括多实例、跨可用区部署、DNS/GSLB 或 Anycast 流量切换，以及故障域内独立的健康检查和容量冗余。DNS TTL 不等于客户端立即切换：本地缓存、递归解析器和既有连接都会影响收敛。跨区域故障切换前要确认幸存区域能否承接额外流量，以及数据库、缓存和外部依赖是否也具备容量。"
+      },
+      {
+        "heading": "实战场景：Round Robin 但 CPU 分布很不均",
+        "body": "假设四个实例接收相近 RPS，其中一个 CPU 90%、另三个约 35%，且该实例 P95 较高。不要直接改成 Least Requests 就宣布解决。先验证实例规格、CPU throttling、请求路径与耗时分布、缓存命中率、GC、长连接分布、热点用户、线程池与下游调用。若是请求成本不均，Least Requests 可能改善在途请求分配；若是某实例性能退化或单一热点键，算法切换只能掩盖问题，仍需修复根因。"
+      },
+      {
+        "heading": "实战场景：服务还活着，但已无法处理请求",
+        "body": "假设 /health 返回 200，但 MongoDB Primary 切换后 Driver 发生重试、连接池 checkout wait 激增，应用请求持续超时。先用业务请求成功率、端到端 P95、连接池等待、下游错误率定位真实瓶颈。Readiness 可以在服务完全无法处理关键请求时摘流，但如果所有实例共享同一个数据库故障，全部摘流会使 LB 没有健康后端。需要设计降级路径、超时预算、重试抑制和恢复预热，而非简单地让每个下游异常都触发 Readiness=false。"
+      },
+      {
+        "heading": "Staff SRE 排障时间线与决策",
+        "body": "0–5 分钟：确定影响范围、用户错误率、P95/P99、受影响 AZ/实例，先止血。5–15 分钟：对齐 LB 健康状态、路由变更、发布、连接数、后端资源与下游依赖事件。15–30 分钟：按证据选择摘除异常节点、限流、关闭高成本功能、回滚或调整重试策略，并评估副作用。恢复后复盘触发条件、传播路径、为什么保护机制失效、哪些指标本可更早发现，并形成可验证的改进项。"
+      },
+      {
+        "heading": "面试追问：如何证明选对了算法？",
+        "body": "面试官问：当前 Round Robin 导致 CPU 倾斜，你建议换成 Least Requests，如何证明这不是拍脑袋？回答应包括：先用实例级 RPS、in-flight、请求耗时、CPU、P95 和错误率建立基线；确认路由决策粒度与连接复用方式；在可控流量或小比例灰度中比较负载方差、用户延迟、吞吐、失败率及回滚阈值；最后解释 Trade-off——算法无法修复慢实例、热点键或共享依赖瓶颈。"
       }
     ]
   },
